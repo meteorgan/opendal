@@ -28,8 +28,6 @@ use futures::FutureExt;
 use futures::StreamExt;
 use futures::TryStreamExt;
 use object_store::path::Path;
-use object_store::GetResult;
-use object_store::GetResultPayload;
 use object_store::ListResult;
 use object_store::MultipartUpload;
 use object_store::ObjectMeta;
@@ -39,6 +37,8 @@ use object_store::PutOptions;
 use object_store::PutPayload;
 use object_store::PutResult;
 use object_store::{GetOptions, UploadPart};
+use object_store::{GetRange, GetResultPayload};
+use object_store::{GetResult, PutMode};
 use opendal::Buffer;
 use opendal::Writer;
 use opendal::{Operator, OperatorInfo};
@@ -138,28 +138,43 @@ impl From<Operator> for OpendalStore {
 #[async_trait]
 impl ObjectStore for OpendalStore {
     async fn put(&self, location: &Path, bytes: PutPayload) -> object_store::Result<PutResult> {
-        self.inner
-            .write(location.as_ref(), Buffer::from_iter(bytes.into_iter()))
-            .into_send()
-            .await
-            .map_err(|err| format_object_store_error(err, location.as_ref()))?;
-        Ok(PutResult {
-            e_tag: None,
-            version: None,
-        })
+        self.put_opts(location, bytes, PutOptions::default()).await
     }
 
     async fn put_opts(
         &self,
-        _location: &Path,
-        _bytes: PutPayload,
-        _opts: PutOptions,
+        location: &Path,
+        bytes: PutPayload,
+        opts: PutOptions,
     ) -> object_store::Result<PutResult> {
-        Err(object_store::Error::NotSupported {
-            source: Box::new(opendal::Error::new(
-                opendal::ErrorKind::Unsupported,
-                "put_opts is not implemented so far",
-            )),
+        let mut future_write = self
+            .inner
+            .write_with(location.as_ref(), Buffer::from_iter(bytes.into_iter()));
+        match opts.mode {
+            PutMode::Overwrite => {}
+            PutMode::Create => {
+                future_write = future_write.if_not_exists(true);
+            }
+            PutMode::Update(update_version) => {
+                let Some(etag) = update_version.e_tag else {
+                    Err(object_store::Error::NotSupported {
+                        source: Box::new(opendal::Error::new(
+                            opendal::ErrorKind::Unsupported,
+                            "etag is required for conditional put",
+                        )),
+                    })?
+                };
+                future_write = future_write.if_match(etag.as_str());
+            }
+        }
+        future_write
+            .into_send()
+            .await
+            .map_err(|err| format_object_store_error(err, location.as_ref()))?;
+
+        Ok(PutResult {
+            e_tag: None,
+            version: None,
         })
     }
 
@@ -193,6 +208,14 @@ impl ObjectStore for OpendalStore {
     }
 
     async fn get(&self, location: &Path) -> object_store::Result<GetResult> {
+        self.get_opts(location, GetOptions::default()).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> object_store::Result<GetResult> {
         let meta = self
             .inner
             .stat(location.as_ref())
@@ -208,21 +231,59 @@ impl ObjectStore for OpendalStore {
             version: meta.version().map(|x| x.to_string()),
         };
 
-        let r = self
-            .inner
-            .reader(location.as_ref())
+        if options.head {
+            return Ok(GetResult {
+                payload: GetResultPayload::Stream(Box::pin(futures::stream::empty())),
+                range: 0..0,
+                meta,
+                attributes: Default::default(),
+            });
+        }
+
+        let mut r = self.inner.reader_with(location.as_ref());
+        if let Some(version) = options.version {
+            r = r.version(version.as_str());
+        }
+        if let Some(if_match) = options.if_match {
+            r = r.if_match(if_match.as_str());
+        }
+        if let Some(if_none_match) = options.if_none_match {
+            r = r.if_none_match(if_none_match.as_str());
+        }
+        if let Some(if_modified_since) = options.if_modified_since {
+            r = r.if_modified_since(if_modified_since);
+        }
+        if let Some(if_unmodified_since) = options.if_unmodified_since {
+            r = r.if_unmodified_since(if_unmodified_since);
+        }
+        let r = r
             .into_send()
             .await
             .map_err(|err| format_object_store_error(err, location.as_ref()))?;
 
+        let mut read_range = 0..meta.size;
+        if let Some(range) = options.range {
+            match range {
+                GetRange::Bounded(r) => {
+                    read_range = r;
+                }
+                GetRange::Offset(r) => {
+                    read_range = r..meta.size;
+                }
+                GetRange::Suffix(r) => {
+                    if r >= meta.size {
+                        read_range = 0..meta.size;
+                    } else {
+                        read_range = (meta.size - r)..meta.size;
+                    }
+                }
+            }
+        }
         let stream = r
-            .into_bytes_stream(0..meta.size as u64)
+            .into_bytes_stream(read_range.start as u64..read_range.end as u64)
             .into_send()
             .await
-            .map_err(|err| object_store::Error::Generic {
-                store: "IoError",
-                source: Box::new(err),
-            })?
+            .map_err(|err| format_object_store_error(err, location.as_ref()))?
             .into_send()
             .map_err(|err| object_store::Error::Generic {
                 store: "IoError",
@@ -231,53 +292,26 @@ impl ObjectStore for OpendalStore {
 
         Ok(GetResult {
             payload: GetResultPayload::Stream(Box::pin(stream)),
-            range: 0..meta.size,
+            range: read_range.start..read_range.end,
             meta,
             attributes: Default::default(),
         })
     }
 
-    async fn get_opts(
-        &self,
-        _location: &Path,
-        _options: GetOptions,
-    ) -> object_store::Result<GetResult> {
-        Err(object_store::Error::NotSupported {
-            source: Box::new(opendal::Error::new(
-                opendal::ErrorKind::Unsupported,
-                "get_opts is not implemented so far",
-            )),
-        })
-    }
-
     async fn get_range(&self, location: &Path, range: Range<usize>) -> object_store::Result<Bytes> {
-        let bs = self
-            .inner
-            .read_with(location.as_ref())
-            .range(range.start as u64..range.end as u64)
-            .into_future()
-            .into_send()
-            .await
-            .map_err(|err| format_object_store_error(err, location.as_ref()))?;
-
-        Ok(bs.to_bytes())
+        let options = GetOptions {
+            range: Some(GetRange::Bounded(range)),
+            ..Default::default()
+        };
+        self.get_opts(location, options).await?.bytes().await
     }
 
     async fn head(&self, location: &Path) -> object_store::Result<ObjectMeta> {
-        let meta = self
-            .inner
-            .stat(location.as_ref())
-            .into_send()
-            .await
-            .map_err(|err| format_object_store_error(err, location.as_ref()))?;
-
-        Ok(ObjectMeta {
-            location: location.clone(),
-            last_modified: meta.last_modified().unwrap_or_default(),
-            size: meta.content_length() as usize,
-            e_tag: meta.etag().map(|x| x.to_string()),
-            version: meta.version().map(|x| x.to_string()),
-        })
+        let options = GetOptions {
+            head: true,
+            ..Default::default()
+        };
+        self.get_opts(location, options).await.map(|r| r.meta)
     }
 
     async fn delete(&self, location: &Path) -> object_store::Result<()> {
@@ -582,6 +616,39 @@ mod tests {
                 .unwrap(),
             bytes
         );
+    }
+
+    #[tokio::test]
+    async fn test_write_opts_with_version() {
+        let op = Operator::new(services::Memory::default()).unwrap().finish();
+        let object_store: Arc<dyn ObjectStore> = Arc::new(OpendalStore::new(op));
+
+        let path: Path = "data/test.txt".into();
+        let bytes = Bytes::from_static(b"hello, world!");
+        object_store.put(&path, bytes.clone().into()).await.unwrap();
+
+        let meta = object_store.head(&path).await.unwrap();
+
+        assert_eq!(meta.size, 13);
+
+        let res = object_store
+            .put_opts(&path, bytes.into(), PutOptions::default())
+            .await;
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_get_range() {
+        let op = Operator::new(services::Memory::default()).unwrap().finish();
+        let object_store: Arc<dyn ObjectStore> = Arc::new(OpendalStore::new(op));
+
+        let path: Path = "data/test.txt".into();
+        let bytes = Bytes::from_static(b"hello, world!");
+        object_store.put(&path, bytes.clone().into()).await.unwrap();
+
+        let range = 1..5;
+        let result = object_store.get_range(&path, range.clone()).await.unwrap();
+        assert_eq!(result, bytes.slice(range));
     }
 
     #[tokio::test]
