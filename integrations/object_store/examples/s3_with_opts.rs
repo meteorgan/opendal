@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use object_store::path::Path;
-use object_store::{GetOptions, GetRange, ObjectStore, PutMode, PutOptions};
+use object_store::{GetOptions, ObjectStore, PutOptions};
 use object_store_opendal::OpendalStore;
 use opendal::services::S3Config;
 use opendal::Operator;
