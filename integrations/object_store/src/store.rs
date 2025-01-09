@@ -17,12 +17,11 @@
 
 use std::fmt::{self, Debug, Display, Formatter};
 use std::future::IntoFuture;
-use std::ops::Range;
+use std::io;
 use std::sync::Arc;
 
 use crate::utils::*;
 use async_trait::async_trait;
-use bytes::Bytes;
 use futures::stream::BoxStream;
 use futures::FutureExt;
 use futures::StreamExt;
@@ -90,6 +89,7 @@ use tokio::sync::{Mutex, Notify};
 ///     assert_eq!(content, bytes);
 /// }
 /// ```
+#[derive(Clone)]
 pub struct OpendalStore {
     info: Arc<OperatorInfo>,
     inner: Operator,
@@ -102,6 +102,11 @@ impl OpendalStore {
             info: op.info().into(),
             inner: op,
         }
+    }
+
+    /// Get the Operator info.
+    pub fn info(&self) -> &OperatorInfo {
+        self.info.as_ref()
     }
 }
 
@@ -137,10 +142,6 @@ impl From<Operator> for OpendalStore {
 
 #[async_trait]
 impl ObjectStore for OpendalStore {
-    async fn put(&self, location: &Path, bytes: PutPayload) -> object_store::Result<PutResult> {
-        self.put_opts(location, bytes, PutOptions::default()).await
-    }
-
     async fn put_opts(
         &self,
         location: &Path,
@@ -150,6 +151,7 @@ impl ObjectStore for OpendalStore {
         let mut future_write = self
             .inner
             .write_with(location.as_ref(), Buffer::from_iter(bytes.into_iter()));
+        let opts_mode = opts.mode.clone();
         match opts.mode {
             PutMode::Overwrite => {}
             PutMode::Create => {
@@ -167,10 +169,16 @@ impl ObjectStore for OpendalStore {
                 future_write = future_write.if_match(etag.as_str());
             }
         }
-        future_write
-            .into_send()
-            .await
-            .map_err(|err| format_object_store_error(err, location.as_ref()))?;
+        future_write.into_send().await.map_err(|err| {
+            match format_object_store_error(err, location.as_ref()) {
+                object_store::Error::Precondition { path, source }
+                    if opts_mode == PutMode::Create =>
+                {
+                    object_store::Error::AlreadyExists { path, source }
+                }
+                e => e,
+            }
+        })?;
 
         Ok(PutResult {
             e_tag: None,
@@ -207,21 +215,32 @@ impl ObjectStore for OpendalStore {
         })
     }
 
-    async fn get(&self, location: &Path) -> object_store::Result<GetResult> {
-        self.get_opts(location, GetOptions::default()).await
-    }
-
     async fn get_opts(
         &self,
         location: &Path,
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
-        let meta = self
-            .inner
-            .stat(location.as_ref())
-            .into_send()
-            .await
-            .map_err(|err| format_object_store_error(err, location.as_ref()))?;
+        let meta = {
+            let mut s = self.inner.stat_with(location.as_ref());
+            if let Some(version) = &options.version {
+                s = s.version(version.as_str())
+            }
+            if let Some(if_match) = &options.if_match {
+                s = s.if_match(if_match.as_str());
+            }
+            if let Some(if_none_match) = &options.if_none_match {
+                s = s.if_none_match(if_none_match.as_str());
+            }
+            if let Some(if_modified_since) = options.if_modified_since {
+                s = s.if_modified_since(if_modified_since);
+            }
+            if let Some(if_unmodified_since) = options.if_unmodified_since {
+                s = s.if_unmodified_since(if_unmodified_since);
+            }
+            s.into_send()
+                .await
+                .map_err(|err| format_object_store_error(err, location.as_ref()))?
+        };
 
         let meta = ObjectMeta {
             location: location.clone(),
@@ -240,26 +259,27 @@ impl ObjectStore for OpendalStore {
             });
         }
 
-        let mut r = self.inner.reader_with(location.as_ref());
-        if let Some(version) = options.version {
-            r = r.version(version.as_str());
-        }
-        if let Some(if_match) = options.if_match {
-            r = r.if_match(if_match.as_str());
-        }
-        if let Some(if_none_match) = options.if_none_match {
-            r = r.if_none_match(if_none_match.as_str());
-        }
-        if let Some(if_modified_since) = options.if_modified_since {
-            r = r.if_modified_since(if_modified_since);
-        }
-        if let Some(if_unmodified_since) = options.if_unmodified_since {
-            r = r.if_unmodified_since(if_unmodified_since);
-        }
-        let r = r
-            .into_send()
-            .await
-            .map_err(|err| format_object_store_error(err, location.as_ref()))?;
+        let reader = {
+            let mut r = self.inner.reader_with(location.as_ref());
+            if let Some(version) = options.version {
+                r = r.version(version.as_str());
+            }
+            if let Some(if_match) = options.if_match {
+                r = r.if_match(if_match.as_str());
+            }
+            if let Some(if_none_match) = options.if_none_match {
+                r = r.if_none_match(if_none_match.as_str());
+            }
+            if let Some(if_modified_since) = options.if_modified_since {
+                r = r.if_modified_since(if_modified_since);
+            }
+            if let Some(if_unmodified_since) = options.if_unmodified_since {
+                r = r.if_unmodified_since(if_unmodified_since);
+            }
+            r.into_send()
+                .await
+                .map_err(|err| format_object_store_error(err, location.as_ref()))?
+        };
 
         let mut read_range = 0..meta.size;
         if let Some(range) = options.range {
@@ -268,7 +288,11 @@ impl ObjectStore for OpendalStore {
                     read_range = r;
                 }
                 GetRange::Offset(r) => {
-                    read_range = r..meta.size;
+                    if r >= meta.size {
+                        read_range = 0..0;
+                    } else {
+                        read_range = r..meta.size;
+                    }
                 }
                 GetRange::Suffix(r) => {
                     if r >= meta.size {
@@ -279,13 +303,14 @@ impl ObjectStore for OpendalStore {
                 }
             }
         }
-        let stream = r
+
+        let stream = reader
             .into_bytes_stream(read_range.start as u64..read_range.end as u64)
             .into_send()
             .await
             .map_err(|err| format_object_store_error(err, location.as_ref()))?
             .into_send()
-            .map_err(|err| object_store::Error::Generic {
+            .map_err(|err: io::Error| object_store::Error::Generic {
                 store: "IoError",
                 source: Box::new(err),
             });
@@ -296,22 +321,6 @@ impl ObjectStore for OpendalStore {
             meta,
             attributes: Default::default(),
         })
-    }
-
-    async fn get_range(&self, location: &Path, range: Range<usize>) -> object_store::Result<Bytes> {
-        let options = GetOptions {
-            range: Some(GetRange::Bounded(range)),
-            ..Default::default()
-        };
-        self.get_opts(location, options).await?.bytes().await
-    }
-
-    async fn head(&self, location: &Path) -> object_store::Result<ObjectMeta> {
-        let options = GetOptions {
-            head: true,
-            ..Default::default()
-        };
-        self.get_opts(location, options).await.map(|r| r.meta)
     }
 
     async fn delete(&self, location: &Path) -> object_store::Result<()> {
@@ -567,12 +576,12 @@ impl Debug for OpendalMultipartUpload {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
+    use bytes::Bytes;
     use object_store::path::Path;
     use object_store::{ObjectStore, WriteMultipart};
     use opendal::services;
     use rand::prelude::*;
+    use std::sync::Arc;
 
     use super::*;
 
