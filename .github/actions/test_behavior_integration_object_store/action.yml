@@ -41,7 +41,7 @@ runs:
           - name: Run Test Integration Object Store
             shell: bash
             working-directory: integrations/object_store
-            run: cargo test behavior --features tests,${{ inputs.feature }}
+            run: cargo test behavior
             env:
               OPENDAL_TEST: ${{ inputs.service }}
         EOF
