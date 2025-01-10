@@ -21,5 +21,5 @@ where
 }
 
 pub fn new_file_path(dir: &str) -> String {
-    format!("{}/{}", dir, uuid::Uuid::new_v4().to_string())
+    format!("{}/{}", dir, uuid::Uuid::new_v4())
 }

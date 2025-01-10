@@ -11,11 +11,11 @@ use std::time::Duration;
 async fn main() {
     // Configure S3
     let mut cfg = S3Config::default();
-    cfg.access_key_id = Some("minioadmin".to_string());
-    cfg.secret_access_key = Some("minioadmin".to_string());
-    cfg.endpoint = Some("http://127.0.0.1:9000".to_string());
-    cfg.region = Some("local".to_string());
-    cfg.bucket = "first-bucket".to_string();
+    cfg.access_key_id = Some("my_access_key".to_string());
+    cfg.secret_access_key = Some("my_secret_key".to_string());
+    cfg.endpoint = Some("my_endpoint".to_string());
+    cfg.region = Some("my_region".to_string());
+    cfg.bucket = "my_bucket".to_string();
 
     // Create a new operator
     let operator = Operator::from_config(cfg).unwrap().finish();
